@@ -1,8 +1,7 @@
 # agents/base_agent.py
 from abc import ABC, abstractmethod
 from typing import Dict, Any
-from langchain_aws import ChatBedrock
-from langchain.schema import HumanMessage, SystemMessage
+from langchain_aws import BedrockLLM
 from data_loader.document_processor import DocumentProcessor
 
 class BaseAgent(ABC):
@@ -10,13 +9,14 @@ class BaseAgent(ABC):
         self.name = name
         self.document_processor = document_processor
         
-        # CORRECT Bedrock configuration
-        self.llm = ChatBedrock(
-            model_id="us.amazon.nova-pro-v1:0",  # Correct model ID
+        # Use BedrockLLM instead of ChatBedrock - often more reliable
+        self.llm = BedrockLLM(
+            model_id="us.amazon.nova-pro-v1:0",
             region_name="us-west-2",
             model_kwargs={
                 "temperature": 0.1,
-                "max_tokens": 2000
+                "max_tokens": 2000,
+                "top_p": 0.9
             }
         )
         self.system_prompt = self._get_system_prompt()
@@ -30,30 +30,34 @@ class BaseAgent(ABC):
         try:
             relevant_docs = self.document_processor.search_documents(query, k=2)
             if not relevant_docs:
-                return "No relevant context found in documents."
+                return ""
             
-            context = "Relevant document context:\n"
+            context = ""
             for doc_info in relevant_docs[:2]:
                 doc = doc_info['document']
-                context += f"From {doc['source']}:\n{doc['content'][:300]}...\n\n"
+                context += f"Source: {doc['source']}\nContent: {doc['content'][:500]}\n\n"
             
             return context
-        except Exception as e:
-            return f"Error retrieving context: {str(e)}"
+        except:
+            return ""
     
     def invoke(self, query: str) -> str:
         """Invoke the agent with the given query"""
         try:
             context = self.get_context(query)
             
-            # Create proper message format
-            messages = [
-                SystemMessage(content=self.system_prompt),
-                HumanMessage(content=f"Context: {context}\n\nUser Question: {query}")
-            ]
+            prompt = f"""
+            {self.system_prompt}
             
-            response = self.llm.invoke(messages)
-            return response.content
+            {f"CONTEXT FROM DOCUMENTS:\n{context}" if context else "No specific context available."}
+            
+            USER QUESTION: {query}
+            
+            Please provide a helpful response based on the available information.
+            """
+            
+            response = self.llm.invoke(prompt)
+            return response
             
         except Exception as e:
-            return f"Error: {str(e)}"
+            return f"Error invoking agent: {str(e)}"

@@ -1,31 +1,29 @@
 # app.py
 import streamlit as st
-import os
 from data_loader.document_processor import DocumentProcessor
 from agents.multi_agent_system import MultiAgentSystem
 
 st.set_page_config(page_title="AI Agents", page_icon="🤖")
 
-@st.cache_resource
-def load_system():
-    """Load the document processor and agent system"""
-    processor = DocumentProcessor()
-    # Try to load existing vector store
-    if not processor.load_vector_store():
-        st.info("No existing data found. Please add PDF/CSV files to 'data/' folder.")
-    return MultiAgentSystem(processor)
-
 def main():
     st.title("🤖 AI Agents Chat")
-    st.write("Ask about maintenance, field support, or workload management")
     
     # Initialize system
     if "system" not in st.session_state:
         with st.spinner("Loading AI agents..."):
             try:
-                st.session_state.system = load_system()
+                # Initialize document processor
+                processor = DocumentProcessor()
+                if not processor.load_vector_store():
+                    st.info("No vector store found. Please add documents to 'data/' folder.")
+                
+                # Initialize multi-agent system
+                st.session_state.system = MultiAgentSystem(processor)
+                st.success("✅ System loaded successfully!")
+                
             except Exception as e:
-                st.error(f"Failed to load: {e}")
+                st.error(f"❌ System initialization failed: {e}")
+                st.info("Run the Bedrock test above to debug permissions.")
                 return
     
     # Chat interface
@@ -36,19 +34,26 @@ def main():
             try:
                 response = st.session_state.system.invoke(question)
                 
-                # Show final response
+                # Show responses
                 st.write("### 🤖 Response:")
-                st.write(response.get("final_response", "No response"))
                 
-                # Show individual agents in expander
-                with st.expander("See individual agent responses"):
-                    if "maintenance_response" in response:
-                        st.write("**🛠️ Maintenance:**", response["maintenance_response"])
-                    if "field_response" in response:
-                        st.write("**🔧 Field Support:**", response["field_response"])
-                    if "workload_response" in response:
-                        st.write("**📈 Workload:**", response["workload_response"])
+                if "error" in response:
+                    st.error(response["error"])
+                else:
+                    st.write(response.get("final_response", "No response"))
+                    
+                    # Show individual agents
+                    with st.expander("See agent responses"):
+                        agents = {
+                            "🛠️ Maintenance": "maintenance_response",
+                            "🔧 Field Support": "field_support_response", 
+                            "📈 Workload": "workload_response"
+                        }
                         
+                        for name, key in agents.items():
+                            if key in response:
+                                st.write(f"**{name}:** {response[key]}")
+                                
             except Exception as e:
                 st.error(f"Error: {e}")
 
