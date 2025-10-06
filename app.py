@@ -23,7 +23,7 @@ class StreamlitApp:
                     
                     # Load documents
                     pdf_docs = self.document_processor.load_pdf_documents("data/")
-                    csv_docs = self.document_processor.load_csv_documents("data/your_data.csv")  # Update path
+                    csv_docs = self.document_processor.load_csv_documents("data/synthetic_maintenance_records.csv")  # Update path
                     
                     all_docs = pdf_docs + csv_docs
                     

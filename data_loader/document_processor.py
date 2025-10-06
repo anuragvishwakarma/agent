@@ -9,6 +9,7 @@ import json
 import boto3
 import pickle
 import time
+import random
 from datetime import datetime
 
 class DocumentProcessor:
@@ -22,50 +23,73 @@ class DocumentProcessor:
         # Create storage directory if it doesn't exist
         os.makedirs(storage_dir, exist_ok=True)
     
-    def get_bedrock_embedding(self, text: str) -> List[float]:
-        """Get embeddings using Amazon Titan Embeddings via Bedrock"""
-        try:
-            # Clean and prepare text
-            clean_text = text.replace('\n', ' ').strip()
-            if len(clean_text) > 10000:  # Bedrock limit
-                clean_text = clean_text[:10000]
-            
-            body = json.dumps({
-                "inputText": clean_text
-            })
-            
-            response = self.bedrock_runtime.invoke_model(
-                body=body,
-                modelId="amazon.titan-embed-text-v1",
-                accept="application/json",
-                contentType="application/json"
-            )
-            
-            response_body = json.loads(response.get('body').read())
-            embedding = response_body.get('embedding', [])
-            
-            if not embedding:
-                raise ValueError("Empty embedding received")
+    def get_bedrock_embedding(self, text: str, max_retries: int = 5) -> List[float]:
+        """Get embeddings using Amazon Titan Embeddings via Bedrock with retry logic"""
+        for attempt in range(max_retries):
+            try:
+                # Clean and prepare text
+                clean_text = text.replace('\n', ' ').strip()
+                if len(clean_text) > 10000:  # Bedrock limit
+                    clean_text = clean_text[:10000]
                 
-            return embedding
-            
-        except Exception as e:
-            print(f"Bedrock embedding error: {e}")
-            # Fallback to local embeddings if Bedrock fails
-            return self._get_fallback_embedding(text)
+                body = json.dumps({
+                    "inputText": clean_text
+                })
+                
+                # Add exponential backoff with jitter
+                if attempt > 0:
+                    base_delay = min(2 ** attempt + random.uniform(0, 1), 60)  # Max 60 seconds
+                    print(f"🔄 Bedrock retry attempt {attempt + 1}/{max_retries}, waiting {base_delay:.2f}s")
+                    time.sleep(base_delay)
+                
+                response = self.bedrock_runtime.invoke_model(
+                    body=body,
+                    modelId="amazon.titan-embed-text-v1",
+                    accept="application/json",
+                    contentType="application/json"
+                )
+                
+                response_body = json.loads(response.get('body').read())
+                embedding = response_body.get('embedding', [])
+                
+                if not embedding:
+                    raise ValueError("Empty embedding received")
+                
+                # Small delay between successful calls to avoid throttling
+                time.sleep(0.2)
+                return embedding
+                    
+            except Exception as e:
+                error_msg = str(e)
+                print(f"❌ Bedrock embedding attempt {attempt + 1} failed: {error_msg}")
+                
+                # Check if it's a throttling error
+                if "ThrottlingException" in error_msg and attempt < max_retries - 1:
+                    continue
+                elif "AccessDenied" in error_msg:
+                    print("🔐 Access denied - check Bedrock model access permissions")
+                    break
+                else:
+                    print(f"❌ Non-retryable error: {error_msg}")
+                    break
+        
+        # If all retries failed, use fallback
+        print("🔄 Switching to fallback embeddings after Bedrock failures")
+        return self._get_fallback_embedding(text)
     
     def _get_fallback_embedding(self, text: str) -> List[float]:
         """Fallback embedding using sentence transformers"""
         try:
             from sentence_transformers import SentenceTransformer
+            # Use a smaller model for faster loading
             model = SentenceTransformer('all-MiniLM-L6-v2')
             embedding = model.encode(text).tolist()
-            print("Using fallback embeddings")
+            print("✅ Using local fallback embeddings")
             return embedding
         except Exception as e:
-            print(f"Fallback embedding also failed: {e}")
+            print(f"❌ Fallback embedding failed: {e}")
             # Return zero vector as last resort
-            return [0.0] * 384  # Standard dimension for all-MiniLM-L6-v2
+            return [0.0] * 384
     
     def load_pdf_documents(self, pdf_folder: str) -> List[Dict[str, Any]]:
         """Load and process PDF documents with chunking for better embeddings"""
@@ -112,7 +136,7 @@ class DocumentProcessor:
         return pdf_docs
     
     def load_csv_documents(self, csv_path: str) -> List[Dict[str, Any]]:
-        """Load and process CSV documents with intelligent chunking"""
+        """Load and process CSV documents with robust error handling"""
         csv_docs = []
         
         if not os.path.exists(csv_path):
@@ -120,8 +144,33 @@ class DocumentProcessor:
             return csv_docs
             
         try:
-            df = pd.read_csv(csv_path)
+            # Try different CSV reading strategies
+            df = None
+            strategies = [
+                # Strategy 1: Standard read
+                lambda: pd.read_csv(csv_path),
+                # Strategy 2: Handle different separators
+                lambda: pd.read_csv(csv_path, sep=None, engine='python'),
+                # Strategy 3: Skip bad lines
+                lambda: pd.read_csv(csv_path, on_bad_lines='skip', engine='python'),
+                # Strategy 4: Manual parsing as last resort
+                lambda: self._manual_csv_parse(csv_path)
+            ]
             
+            for i, strategy in enumerate(strategies):
+                try:
+                    df = strategy()
+                    print(f"✅ CSV loaded successfully with strategy {i+1}")
+                    break
+                except Exception as e:
+                    print(f"❌ Strategy {i+1} failed: {e}")
+                    continue
+            
+            if df is None or df.empty:
+                print(f"❌ All CSV loading strategies failed for {csv_path}")
+                # Try raw text fallback
+                return self._load_csv_as_raw_text(csv_path)
+                
             # Create multiple representations of the CSV data
             representations = []
             
@@ -143,25 +192,34 @@ class DocumentProcessor:
                 Column: {column}
                 Type: {df[column].dtype}
                 Unique Values: {df[column].nunique()}
-                Sample Values: {df[column].dropna().head(5).tolist()}
+                Sample Values: {df[column].dropna().head(3).tolist()}
                 """
                 representations.append(col_summary)
             
-            # 3. Data chunks for larger CSVs
-            if len(df) > 50:
-                chunk_size = 50
-                for i in range(0, len(df), chunk_size):
+            # 3. Statistical summary for numeric columns
+            numeric_cols = df.select_dtypes(include=[np.number]).columns
+            if not numeric_cols.empty:
+                stats_content = f"""
+                Statistical Summary:
+                {df[numeric_cols].describe().to_string()}
+                """
+                representations.append(stats_content)
+            
+            # 4. Data chunks for larger CSVs
+            if len(df) > 20:
+                chunk_size = 10
+                for i in range(0, min(len(df), 50), chunk_size):  # Limit to first 50 rows
                     chunk = df.iloc[i:i+chunk_size]
                     chunk_content = f"""
                     Data Chunk {i//chunk_size + 1} (Rows {i+1}-{min(i+chunk_size, len(df))}):
-                    {chunk.to_string()}
+                    {chunk.to_string(max_rows=10, max_cols=10)}
                     """
                     representations.append(chunk_content)
             else:
                 # Full data for small CSVs
                 full_data_content = f"""
-                Complete Data:
-                {df.to_string()}
+                Complete Data (first 20 rows):
+                {df.head(20).to_string(max_rows=20, max_cols=10)}
                 """
                 representations.append(full_data_content)
             
@@ -169,44 +227,98 @@ class DocumentProcessor:
             for i, content in enumerate(representations):
                 csv_docs.append({
                     'source': f"{os.path.basename(csv_path)}_rep_{i+1}",
-                    'content': content,
+                    'content': content.strip(),
                     'type': 'csv',
                     'original_file': os.path.basename(csv_path),
-                    'representation_type': ['summary', 'column_wise', 'data_chunk'][min(i, 2)],
+                    'representation_type': ['summary', 'column_wise', 'statistics', 'data_chunk'][min(i, 3)],
                     'file_path': csv_path,
                     'total_rows': len(df),
                     'total_columns': len(df.columns)
                 })
                 
-            print(f"Loaded {len(csv_docs)} CSV representations from {csv_path}")
+            print(f"✅ Loaded {len(csv_docs)} CSV representations from {csv_path}")
             
         except Exception as e:
-            print(f"Error processing CSV {csv_path}: {e}")
+            print(f"❌ Error processing CSV {csv_path}: {e}")
+            # Try raw text fallback
+            return self._load_csv_as_raw_text(csv_path)
             
         return csv_docs
-    
+
+    def _manual_csv_parse(self, csv_path: str) -> pd.DataFrame:
+        """Manual CSV parsing as last resort"""
+        import csv
+        rows = []
+        try:
+            with open(csv_path, 'r', encoding='utf-8', errors='ignore') as f:
+                reader = csv.reader(f)
+                for i, row in enumerate(reader):
+                    if i < 100:  # Limit to first 100 rows
+                        rows.append(row)
+                    else:
+                        break
+            
+            # Create DataFrame from rows
+            if len(rows) > 1:
+                # Use first row as header, rest as data
+                df = pd.DataFrame(rows[1:], columns=rows[0])
+                return df
+            elif len(rows) == 1:
+                # Only header row
+                df = pd.DataFrame(columns=rows[0])
+                return df
+            else:
+                return pd.DataFrame()
+        except Exception as e:
+            print(f"Manual CSV parsing failed: {e}")
+            return pd.DataFrame()
+
+    def _load_csv_as_raw_text(self, csv_path: str) -> List[Dict[str, Any]]:
+        """Load CSV as raw text when all parsing fails"""
+        csv_docs = []
+        try:
+            with open(csv_path, 'r', encoding='utf-8', errors='ignore') as f:
+                content = f.read(5000)  # Read first 5000 characters
+            
+            csv_docs.append({
+                'source': os.path.basename(csv_path),
+                'content': f"Raw CSV content (first 5000 chars): {content}",
+                'type': 'csv',
+                'original_file': os.path.basename(csv_path),
+                'file_path': csv_path,
+                'representation_type': 'raw_text'
+            })
+            print("✅ Loaded CSV as raw text fallback")
+        except Exception as fallback_error:
+            print(f"❌ Even raw text fallback failed: {fallback_error}")
+            
+        return csv_docs
+
     def _chunk_text(self, text: str, chunk_size: int = 1000, overlap: int = 200) -> List[str]:
         """Split text into overlapping chunks for better context"""
         chunks = []
         start = 0
+        text_length = len(text)
         
-        while start < len(text):
+        while start < text_length:
             end = start + chunk_size
-            if end > len(text):
-                end = len(text)
+            if end > text_length:
+                end = text_length
             
             chunk = text[start:end]
             chunks.append(chunk)
             
-            if end == len(text):
+            if end == text_length:
                 break
                 
             start = end - overlap  # Overlap for context continuity
-            
+            if start < 0:
+                start = 0
+                
         return chunks
     
-    def create_vector_store(self, documents: List[Dict[str, Any]], save_locally: bool = True):
-        """Create FAISS vector store from documents using Bedrock embeddings"""
+    def create_vector_store(self, documents: List[Dict[str, Any]], save_locally: bool = True, batch_delay: float = 0.5):
+        """Create FAISS vector store with rate limiting"""
         if not documents:
             print("No documents to process")
             return
@@ -217,23 +329,29 @@ class DocumentProcessor:
         valid_documents = []
         
         for i, doc in enumerate(documents):
-            if i % 10 == 0:  # Progress indicator
-                print(f"Processing document {i+1}/{len(documents)}")
+            if i % 5 == 0:  # More frequent progress updates
+                print(f"📄 Processing document {i+1}/{len(documents)}")
                 
             try:
+                # Add delay between batches to avoid throttling
+                if i > 0 and i % 10 == 0:
+                    print(f"⏳ Batch delay of {batch_delay}s to avoid throttling...")
+                    time.sleep(batch_delay)
+                
                 embedding = self.get_bedrock_embedding(doc['content'])
                 
                 if embedding and len(embedding) > 0:
                     embeddings.append(embedding)
                     valid_documents.append(doc)
                 else:
-                    print(f"Skipping document {doc['source']} - empty embedding")
+                    print(f"⚠️ Skipping document {doc['source']} - empty embedding")
                     
             except Exception as e:
-                print(f"Error generating embedding for {doc['source']}: {e}")
+                print(f"❌ Error generating embedding for {doc['source']}: {e}")
+                # Continue with other documents even if one fails
         
         if not embeddings:
-            print("No valid embeddings generated")
+            print("❌ No valid embeddings generated")
             return
             
         # Convert to numpy array
@@ -317,40 +435,45 @@ class DocumentProcessor:
             return False
     
     def search_documents(self, query: str, k: int = 5) -> List[Dict[str, Any]]:
-        """Search for relevant documents using Bedrock embeddings"""
+        """Search for relevant documents with retry logic"""
         if self.index is None or len(self.documents) == 0:
             print("Vector store not initialized or empty")
             return []
         
-        try:
-            # Get query embedding
-            query_embedding = self.get_bedrock_embedding(query)
-            query_array = np.array([query_embedding]).astype('float32')
-            
-            # Search
-            distances, indices = self.index.search(query_array, min(k, len(self.documents)))
-            
-            results = []
-            for i, idx in enumerate(indices[0]):
-                if idx < len(self.documents):
-                    # Convert distance to similarity score (higher is better)
-                    similarity_score = 1 / (1 + distances[0][i]) if distances[0][i] > 0 else 1.0
-                    
-                    results.append({
-                        'document': self.documents[idx],
-                        'score': similarity_score,
-                        'distance': float(distances[0][i])
-                    })
-            
-            # Sort by score (highest first)
-            results.sort(key=lambda x: x['score'], reverse=True)
-            
-            print(f"🔍 Found {len(results)} relevant documents for query: '{query[:50]}...'")
-            return results
-            
-        except Exception as e:
-            print(f"Error searching documents: {e}")
-            return []
+        for attempt in range(3):  # Retry search up to 3 times
+            try:
+                # Get query embedding with retry
+                query_embedding = self.get_bedrock_embedding(query)
+                query_array = np.array([query_embedding]).astype('float32')
+                
+                # Search
+                distances, indices = self.index.search(query_array, min(k, len(self.documents)))
+                
+                results = []
+                for i, idx in enumerate(indices[0]):
+                    if idx < len(self.documents):
+                        # Convert distance to similarity score (higher is better)
+                        similarity_score = 1 / (1 + distances[0][i]) if distances[0][i] > 0 else 1.0
+                        
+                        results.append({
+                            'document': self.documents[idx],
+                            'score': similarity_score,
+                            'distance': float(distances[0][i])
+                        })
+                
+                # Sort by score (highest first)
+                results.sort(key=lambda x: x['score'], reverse=True)
+                
+                print(f"🔍 Found {len(results)} relevant documents for query")
+                return results
+                
+            except Exception as e:
+                print(f"❌ Search attempt {attempt + 1} failed: {e}")
+                if attempt < 2:  # Not the last attempt
+                    time.sleep(2 ** attempt)  # Exponential backoff
+                    continue
+                else:
+                    return []
     
     def _get_document_types(self) -> Dict[str, int]:
         """Get document type statistics"""
